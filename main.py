@@ -1093,9 +1093,24 @@ _LOCALES: dict[str, dict] = {}
 
 
 def load_locales() -> None:
+    """Load external locale files when present, retaining embedded safe defaults.
+
+    Locale files are deployment assets, but a missing optional locale must not
+    prevent the bot from starting. Missing or malformed files fall back to the
+    embedded dictionaries defined above.
+    """
+    locale_dir = Path(__file__).parent / "locale"
     for lang in config.LANGS:
-        p = Path(__file__).parent / "locale" / f"{lang}.json"
-        _LOCALES[lang] = json.loads(p.read_text(encoding="utf-8"))
+        fallback = dict(_LOCALES.get(lang, {}))
+        path = locale_dir / f"{lang}.json"
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("locale root must be an object")
+            fallback.update(loaded)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logging.getLogger("bot").warning("Using embedded %s locale: %s", lang, exc)
+        _LOCALES[lang] = fallback
 
 
 def t(lang: str, key: str, **kw) -> str:
