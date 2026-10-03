@@ -1,28 +1,18 @@
-"""
-Passport Photo Telegram Bot — single-file build.
+"""Passport Photo Bot — single-file Railway deployment entry point.
 
-Everything (config, i18n, storage, image pipeline, keyboards, handlers,
-entry point) lives in this one file so the project stays easy to deploy
-and read. Only data files remain external:
-  - locale/en.json, locale/hi.json   (UI text strings)
-  - indian_passport_a4.json           (A4 sheet template, optional)
-
-Run:
-    pip install -r requirements.txt
-    cp .env.example .env   # fill in BOT_TOKEN
-    python bot.py
+All bot configuration, persistence, image processing, UI, handlers, and startup
+logic live in this file. Sensitive values are read from environment variables.
 """
 from __future__ import annotations
 
-# ----------------------------------------------------------------------
-# Standard library
-# ----------------------------------------------------------------------
 import asyncio
+import base64
 import functools
 import io
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
@@ -31,22 +21,16 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
-# ----------------------------------------------------------------------
-# Third-party
-# ----------------------------------------------------------------------
-import aiosqlite
 import cv2
 import numpy as np
+import aiosqlite
 import pillow_heif
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
-from reportlab.lib.units import mm as RL_MM
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas as rl_canvas
-
-from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from PIL import Image, ImageDraw, ImageEnhance, ImageOps
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -54,89 +38,86 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, InputMediaPhoto, Message, TelegramObject,
-)
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+                          InlineKeyboardMarkup, InputMediaPhoto, Message, TelegramObject)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas as rl_canvas
 
-pillow_heif.register_heif_opener()
 load_dotenv()
+pillow_heif.register_heif_opener()
 
-
-# ========================================================================
-# CONFIG
-# ========================================================================
-import os
-
+# ============================== Configuration ==============================
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data")).resolve()
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
 TEMP_DIR = DATA_DIR / "tmp"
 DB_PATH = DATA_DIR / "bot.db"
-TEMPLATE_PATH = BASE_DIR / "indian_passport_a4.json"
-LOCALE_DIR = BASE_DIR / "locale"
-
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS: set[int] = {
-    int(x) for x in os.getenv("ADMIN_IDS", "8753914631").replace(" ", "").split(",") if x
-}
-MODE: str = os.getenv("MODE", "polling").lower()  # polling | webhook
-WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
-WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT: int = int(os.getenv("WEBHOOK_PORT", "8080"))
-
-MAX_CONCURRENT_JOBS: int = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
-TEMP_TTL_MINUTES: int = int(os.getenv("TEMP_TTL_MINUTES", "30"))
-DEFAULT_LANG: str = os.getenv("DEFAULT_LANG", "en")
-LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-
-WORKING_PX = 900                     # low-res working copy for fast previews
-MAX_FILE_BYTES = 20 * 1024 * 1024    # Telegram bot download limit
-MAX_PIXELS = 40_000_000              # decompression-bomb guard
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+try:
+    ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "8753914631").replace(" ", "").split(",") if x}
+except ValueError:
+    ADMIN_IDS = set()
+MODE = os.getenv("MODE", "polling").lower().strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+TEMP_TTL_MINUTES = max(1, int(os.getenv("TEMP_TTL_MINUTES", "30")))
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en") if os.getenv("DEFAULT_LANG", "en") in {"en", "hi"} else "en"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+WORKING_PX = 900
+MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_PIXELS = 40_000_000
 FLOOD_WINDOW_S = 3.0
 FLOOD_MAX_EVENTS = 6
-
 LANGS = ("en", "hi")
-
+TEMPLATE_PATH = BASE_DIR / "templates" / "indian_passport_a4.json"
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+config = SimpleNamespace(**{k: v for k, v in {
+    "BASE_DIR": BASE_DIR, "DATA_DIR": DATA_DIR, "TEMP_DIR": TEMP_DIR, "DB_PATH": DB_PATH,
+    "BOT_TOKEN": BOT_TOKEN, "ADMIN_IDS": ADMIN_IDS, "MODE": MODE, "WEBHOOK_URL": WEBHOOK_URL,
+    "WEBHOOK_HOST": WEBHOOK_HOST, "WEBHOOK_PORT": WEBHOOK_PORT,
+    "MAX_CONCURRENT_JOBS": MAX_CONCURRENT_JOBS, "TEMP_TTL_MINUTES": TEMP_TTL_MINUTES,
+    "DEFAULT_LANG": DEFAULT_LANG, "LOG_LEVEL": LOG_LEVEL, "WORKING_PX": WORKING_PX,
+    "MAX_FILE_BYTES": MAX_FILE_BYTES, "MAX_PIXELS": MAX_PIXELS, "FLOOD_WINDOW_S": FLOOD_WINDOW_S,
+    "FLOOD_MAX_EVENTS": FLOOD_MAX_EVENTS, "LANGS": LANGS, "TEMPLATE_PATH": TEMPLATE_PATH,
+}.items()})
+config.ensure_dirs = ensure_dirs
 
-# ========================================================================
-# STATES + I18N
-# ========================================================================
-class Flow(StatesGroup):
-    waiting_language = State()
-    waiting_custom_size = State()
-    waiting_custom_colour = State()
-    waiting_copies = State()
-    waiting_text_strip = State()
-    waiting_broadcast = State()
-    waiting_face_pick = State()
-    waiting_manual_crop = State()
-
-
-_LOCALES: dict[str, dict] = {}
-
-
+# ============================== Localization ==============================
+_LOCALES = {
+    'en': {'lang_name': 'English', 'choose_language': 'Choose your language / अपनी भाषा चुनें', 'welcome': 'Welcome to Passport Photo Bot 📷\n\nSend any photo and get a compliant passport photo plus a print-ready A4 sheet in seconds.\n\n3 tips for the best result:\n1. Stand in plain, even light against a plain wall.\n2. Look straight at the camera, no smile, no shadow.\n3. Send the photo as a <b>File / Document</b> (not a compressed photo) for full quality.\n\nNow send a photo to begin.', 'privacy_note': 'Privacy: your photos are processed in memory and temp files, then deleted within {ttl} minutes, on /cancel, or right after export. Nothing is shared. Type /privacy for details or use "Delete my data" in /settings.', 'help': 'Send a photo (as photo or file). I will find the face, remove the background, fit the size and show a preview.\n\nCommands:\n/size — photo size preset\n/background — background colour\n/copies — copies on the sheet\n/paper — paper size\n/language — हिन्दी / English\n/reset — reset all edits\n/cancel — clear current session\n/privacy — what happens to your data', 'privacy_full': 'Your photos are processed only to make your passport photo. They are stored as temp files and deleted within {ttl} minutes, on /cancel, or after export. Settings (language, presets) are stored in a small database and can be wiped any time with "Delete my data" in /settings. No photo content is logged.', 'send_file_hint': 'For full quality, send the photo as a File / Document. Telegram compresses normal photos to about 1280 px.', 'file_too_large': 'That file is too large for a Telegram bot (over 20 MB). Please downsize it or send a smaller copy.', 'bad_file_type': 'I can read JPG, PNG, WEBP and HEIC photos. That file type is not supported.', 'no_face': 'No face found. Stand in even light, face the camera straight on, and send the photo again — as a File for best quality.\n\nOr tap Manual crop to place the photo yourself.', 'multi_face': 'I found {n} faces. Which person should I use? Tap the number.', 'manual_crop': 'Manual crop', 'stage_checking': '⏳ Checking photo…', 'stage_face': '⏳ Finding face…', 'stage_bg': '⏳ Removing background…', 'stage_fit': '⏳ Fitting size…', 'stage_finish': '⏳ Finishing…', 'queue_position': 'You are number {n} in the queue…', 'card_title': '<b>{size_name} · {w} × {h} mm · {dpi} DPI</b>\nBackground: {bg}   Glow: {glow}   Copies: {copies} on {paper}', 'check_face': 'Face found', 'check_head': 'Head size in range', 'check_center': 'Face centred', 'check_tilt': 'Head not tilted', 'check_eyes': 'Eyes open', 'check_bg': 'Background uniform', 'check_bright': 'Brightness OK', 'check_res': 'Resolution sufficient', 'check_shadow': 'No heavy face shadows', 'menu_size': 'Size', 'menu_background': 'Background', 'menu_enhance': 'Enhance', 'menu_crop': 'Crop', 'menu_sheet': 'Sheet', 'menu_download': '⬇️ Download', 'menu_compare': 'Compare', 'menu_guides': 'Guide lines', 'menu_fix_auto': 'Fix automatically', 'back': '« Back', 'reset': 'Reset', 'undo': '↩️ Undo', 'redo': '↪️ Redo', 'size_title': 'Choose the photo size:', 'size_custom_prompt': 'Send the size as width × height, for example <code>35x45 mm</code>, <code>2x2 in</code> or <code>413x531 px</code>.', 'size_bad': 'I could not read that size. Try e.g. <code>35x45 mm</code> or <code>2x2 in</code>.', 'bg_title': 'Choose the background colour:', 'bg_custom_prompt': 'Send a HEX colour code, e.g. <code>#FF5733</code> — or send a photo and I will pick its average colour.', 'bg_bad_hex': 'That is not a valid HEX colour. Example: <code>#4A90D9</code>', 'bg_transparent': 'Transparent (PNG)', 'enhance_title': 'Enhance — tap − / + to adjust. Preview updates after every tap.', 'enh_glow': 'Glow', 'enh_exposure': 'Exposure', 'enh_brightness': 'Brightness', 'enh_contrast': 'Contrast', 'enh_saturation': 'Saturation', 'enh_warmth': 'Warmth', 'enh_sharpness': 'Sharpness', 'enh_smooth': 'Skin smoothing', 'enh_denoise': 'Denoise', 'enh_look': 'Look', 'look_natural': 'Natural', 'look_bright': 'Bright', 'look_studio': 'Studio', 'look_bw': 'Black & white', 'enh_auto': 'Auto enhance', 'enh_boost': 'Quality boost', 'crop_title': 'Crop — move, zoom, rotate. Fixed to {size}.', 'crop_step': 'Step: {step}', 'crop_autofit': 'Auto-fit face', 'sheet_title': 'Sheet — paper, copies and layout.', 'sheet_paper': 'Paper: {paper}', 'sheet_copies': 'Copies: {copies}', 'sheet_maxfit': 'Max fit', 'sheet_margins': 'Margins: {m} mm', 'sheet_gap': 'Gap: {g} mm', 'sheet_cuts_on': 'Cut marks: on', 'sheet_cuts_off': 'Cut marks: off', 'sheet_border_on': 'Border: on', 'sheet_border_off': 'Border: off', 'sheet_type_number': 'Or just type a number of copies.', 'copies_overflow': '{n} copies do not fit on {paper} (max {max}). Try Max fit or a bigger paper.', 'download_done': 'Done ✅\nPrint tip: print at <b>100% / Actual size</b>, no scaling.', 'target_kb_title': 'Target file size for online forms:', 'target_kb_done': 'Saved at {kb} KB.', 'compare_caption': 'Original (left) vs processed (right)', 'session_cleared': 'Session cleared. Send a new photo whenever you are ready.', 'reset_done': 'All edits reset to automatic.', 'session_expired': 'That session expired. Send the photo again to continue.', 'resume_or_new': 'Welcome back. Resume your last session or send a new photo to start fresh.', 'resume': 'Resume', 'retry': 'Retry', 'error_generic': 'Processing failed at the last step. Tap Retry or send the photo again.', 'settings_title': 'Settings', 'set_dpi': 'Export DPI: {dpi}', 'set_delete_data': 'Delete my data', 'set_preset_save': 'Save as my preset', 'set_preset_use': 'Use my preset', 'preset_saved': 'Preset saved.', 'preset_applied': 'Preset applied.', 'no_preset': 'No preset saved yet.', 'data_deleted': 'All your data and files are deleted.', 'admin_only': 'Admins only.', 'admin_stats': 'Users: {users}\nJobs today: {jobs}\nErrors today: {errors}\nAvg processing: {avg}s', 'admin_health': 'OK. Queue: {q}, temp files: {t}', 'broadcast_prompt': 'Send the message to broadcast to all users.', 'broadcast_done': 'Broadcast sent to {n} users.', 'cancel': 'Cancelled.', 'bg_white': 'White', 'bg_offwhite': 'Off-white', 'bg_lightgrey': 'Light grey', 'bg_lightblue': 'Light blue', 'bg_skyblue': 'Sky blue', 'bg_red': 'Red', 'bg_yellow': 'Yellow', 'bg_green': 'Green', 'bg_black': 'Black', 'bg_custom': 'Custom colour…', 'size_in_passport': 'Indian Passport 35×45', 'size_in_visa': 'Indian Visa / OCI 51×51', 'size_pan': 'PAN card 25×35', 'size_stamp': 'Stamp 20×25', 'size_us': 'US passport 2×2 in', 'size_schengen': 'UK / Schengen 35×45', 'size_custom': 'Custom…', 'restore_more': 'Restore more', 'erase_more': 'Erase more', 'feather': 'Edge softness', 'edge_shift': 'Edge in/out', 'bg_edge_title': 'Edge quality — soften, grow or shrink the mask edge.', 'text_strip_prompt': 'Send the text for the strip under the photo (name and date), or tap Back.', 'delete_data_confirm': 'This deletes your settings, presets and session. Tap again to confirm.', 'album_processing': 'Processing {n} photos — one moment…'},
+    'hi': {'lang_name': 'हिन्दी', 'choose_language': 'Choose your language / अपनी भाषा चुनें', 'welcome': 'पासपोर्ट फोटो बॉट में स्वागत है 📷\n\nकोई भी फोटो भेजें और कुछ ही सेकंड में मानक पासपोर्ट फोटो और प्रिंट के लिए तैयार A4 शीट पाएँ।\n\nबेहतर नतीजे के 3 तरीके:\n1. सादी दीवार के सामने, समान रोशनी में खड़े हों।\n2. कैमरे की तरफ सीधे देखें, बिना मुस्कान, बिना परछाई।\n3. पूरी क्वालिटी के लिए फोटो को <b>File / Document</b> के रूप में भेजें।\n\nशुरू करने के लिए एक फोटो भेजें।', 'privacy_note': 'निजता: आपकी फोटो सिर्फ मेमोरी और अस्थायी फाइलों में संसाधित होती हैं और {ttl} मिनट के भीतर, /cancel पर, या एक्सपोर्ट के तुरंत बाद मिटा दी जाती हैं। विवरण के लिए /privacy देखें।', 'help': 'फोटो भेजें (फोटो या फाइल के रूप में)। मैं चेहरा पहचानकर बैकग्राउंड हटाकर साइज़ फिट करूँगा और प्रीव्यू दिखाऊँगा।\n\nकमांड:\n/size — फोटो साइज़\n/background — बैकग्राउंड रंग\n/copies — शीट पर कॉपी\n/paper — पेपर साइज़\n/language — हिन्दी / English\n/reset — सारे बदलाव रीसेट\n/cancel — सत्र साफ़ करें\n/privacy — आपके डेटा की जानकारी', 'privacy_full': 'आपकी फोटो सिर्फ पासपोर्ट फोटो बनाने के लिए संसाधित होती है। ये अस्थायी फाइलों में रहती हैं और {ttl} मिनट के भीतर, /cancel पर या एक्सपोर्ट के बाद मिट जाती हैं। सेटिंग्स छोटे डेटाबेस में रहती हैं और /settings में "मेरा डेटा मिटाएँ" से कभी भी हटाई जा सकती हैं। फोटो की सामग्री लॉग नहीं होती।', 'send_file_hint': 'पूरी क्वालिटी के लिए फोटो को File / Document के रूप में भेजें। Telegram सामान्य फोटो को लगभग 1280 px तक सिकोड़ देता है।', 'file_too_large': 'यह फाइल Telegram बॉट के लिए बहुत बड़ी है (20 MB से अधिक)। कृपया छोटी कॉपी भेजें।', 'bad_file_type': 'मैं JPG, PNG, WEBP और HEIC फोटो पढ़ सकता हूँ। यह फाइल प्रकार समर्थित नहीं है।', 'no_face': 'कोई चेहरा नहीं मिला। समान रोशनी में खड़े हों, कैमरे की ओर सीधे देखें और फोटो दोबारा भेजें — बेहतर क्वालिटी के लिए File के रूप में।\n\nया खुद क्रॉप करने के लिए मैन्युअल क्रॉप दबाएँ।', 'multi_face': 'मुझे {n} चेहरे मिले। किस व्यक्ति का उपयोग करूँ? नंबर दबाएँ।', 'manual_crop': 'मैन्युअल क्रॉप', 'stage_checking': '⏳ फोटो जाँची जा रही है…', 'stage_face': '⏳ चेहरा खोजा जा रहा है…', 'stage_bg': '⏳ बैकग्राउंड हटाया जा रहा है…', 'stage_fit': '⏳ साइज़ फिट किया जा रहा है…', 'stage_finish': '⏳ अंतिम चरण…', 'queue_position': 'आप कतार में नंबर {n} पर हैं…', 'card_title': '<b>{size_name} · {w} × {h} mm · {dpi} DPI</b>\nबैकग्राउंड: {bg}   ग्लो: {glow}   कॉपी: {copies} ({paper})', 'check_face': 'चेहरा मिला', 'check_head': 'सिर का आकार सही', 'check_center': 'चेहरा केंद्र में', 'check_tilt': 'सिर सीधा', 'check_eyes': 'आँखें खुली', 'check_bg': 'बैकग्राउंड एक समान', 'check_bright': 'रोशनी ठीक', 'check_res': 'रिज़ॉल्यूशन पर्याप्त', 'check_shadow': 'चेहरे पर गहरी परछाई नहीं', 'menu_size': 'साइज़', 'menu_background': 'बैकग्राउंड', 'menu_enhance': 'सुधार', 'menu_crop': 'क्रॉप', 'menu_sheet': 'शीट', 'menu_download': '⬇️ डाउनलोड', 'menu_compare': 'तुलना', 'menu_guides': 'गाइड लाइनें', 'menu_fix_auto': 'अपने आप ठीक करें', 'back': '« वापस', 'reset': 'रीसेट', 'undo': '↩️ पूर्ववत', 'redo': '↪️ फिर से', 'size_title': 'फोटो साइज़ चुनें:', 'size_custom_prompt': 'साइज़ भेजें, जैसे <code>35x45 mm</code>, <code>2x2 in</code> या <code>413x531 px</code>।', 'size_bad': 'यह साइज़ समझ नहीं आया। जैसे <code>35x45 mm</code> या <code>2x2 in</code> लिखें।', 'bg_title': 'बैकग्राउंड रंग चुनें:', 'bg_custom_prompt': 'HEX रंग कोड भेजें, जैसे <code>#FF5733</code> — या कोई फोटो भेजें, मैं उसका औसत रंग लूँगा।', 'bg_bad_hex': 'यह सही HEX रंग नहीं है। उदाहरण: <code>#4A90D9</code>', 'bg_transparent': 'पारदर्शी (PNG)', 'enhance_title': 'सुधार — − / + दबाकर बदलें। हर टैप पर प्रीव्यू अपडेट होगा।', 'enh_glow': 'ग्लो', 'enh_exposure': 'एक्सपोज़र', 'enh_brightness': 'चमक', 'enh_contrast': 'कंट्रास्ट', 'enh_saturation': 'संतृप्ति', 'enh_warmth': 'गर्माहट', 'enh_sharpness': 'तीक्ष्णता', 'enh_smooth': 'त्वचा स्मूदिंग', 'enh_denoise': 'शोर कम करें', 'enh_look': 'लुक', 'look_natural': 'नैचुरल', 'look_bright': 'ब्राइट', 'look_studio': 'स्टूडियो', 'look_bw': 'ब्लैक एंड व्हाइट', 'enh_auto': 'ऑटो एन्हांस', 'enh_boost': 'क्वालिटी बूस्ट', 'crop_title': 'क्रॉप — खिसकाएँ, ज़ूम, घुमाएँ। साइज़ {size} तय है।', 'crop_step': 'कदम: {step}', 'crop_autofit': 'चेहरा ऑटो-फिट', 'sheet_title': 'शीट — पेपर, कॉपी और लेआउट।', 'sheet_paper': 'पेपर: {paper}', 'sheet_copies': 'कॉपी: {copies}', 'sheet_maxfit': 'अधिकतम फिट', 'sheet_margins': 'मार्जिन: {m} mm', 'sheet_gap': 'गैप: {g} mm', 'sheet_cuts_on': 'कट मार्क: चालू', 'sheet_cuts_off': 'कट मार्क: बंद', 'sheet_border_on': 'बॉर्डर: चालू', 'sheet_border_off': 'बॉर्डर: बंद', 'sheet_type_number': 'या कॉपी की संख्या सीधे लिखें।', 'copies_overflow': '{paper} पर {n} कॉपी नहीं आतीं (अधिकतम {max})। अधिकतम फिट या बड़ा पेपर चुनें।', 'download_done': 'हो गया ✅\nप्रिंट टिप: <b>100% / Actual size</b> पर प्रिंट करें, स्केलिंग नहीं।', 'target_kb_title': 'ऑनलाइन फ़ॉर्म के लिए फाइल साइज़:', 'target_kb_done': '{kb} KB पर सहेजा गया।', 'compare_caption': 'मूल (बाएँ) बनाम संसाधित (दाएँ)', 'session_cleared': 'सत्र साफ़ हो गया। तैयार होने पर नई फोटो भेजें।', 'reset_done': 'सारे बदलाव ऑटोमैटिक पर रीसेट।', 'session_expired': 'वह सत्र समाप्त हो गया। जारी रखने के लिए फोटो दोबारा भेजें।', 'resume_or_new': 'फिर से स्वागत है। पिछला सत्र जारी रखें या नई फोटो भेजें।', 'resume': 'जारी रखें', 'retry': 'फिर कोशिश करें', 'error_generic': 'अंतिम चरण में प्रोसेसिंग विफल रही। Retry दबाएँ या फोटो दोबारा भेजें।', 'settings_title': 'सेटिंग्स', 'set_dpi': 'एक्सपोर्ट DPI: {dpi}', 'set_delete_data': 'मेरा डेटा मिटाएँ', 'set_preset_save': 'मेरे प्रीसेट में सहेजें', 'set_preset_use': 'मेरा प्रीसेट लगाएँ', 'preset_saved': 'प्रीसेट सहेजा गया।', 'preset_applied': 'प्रीसेट लगाया गया।', 'no_preset': 'अभी कोई प्रीसेट नहीं है।', 'data_deleted': 'आपका सारा डेटा और फाइलें मिटा दी गईं।', 'admin_only': 'केवल एडमिन।', 'admin_stats': 'उपयोगकर्ता: {users}\nआज की जॉब: {jobs}\nआज की त्रुटियाँ: {errors}\nऔसत समय: {avg}s', 'admin_health': 'ठीक है। कतार: {q}, अस्थायी फाइलें: {t}', 'broadcast_prompt': 'सभी उपयोगकर्ताओं को भेजने के लिए संदेश लिखें।', 'broadcast_done': '{n} उपयोगकर्ताओं को संदेश भेजा गया।', 'cancel': 'रद्द किया गया।', 'bg_white': 'सफ़ेद', 'bg_offwhite': 'ऑफ़-व्हाइट', 'bg_lightgrey': 'हल्का ग्रे', 'bg_lightblue': 'हल्का नीला', 'bg_skyblue': 'आसमानी', 'bg_red': 'लाल', 'bg_yellow': 'पीला', 'bg_green': 'हरा', 'bg_black': 'काला', 'bg_custom': 'अपना रंग…', 'size_in_passport': 'भारतीय पासपोर्ट 35×45', 'size_in_visa': 'भारतीय वीज़ा / OCI 51×51', 'size_pan': 'PAN कार्ड 25×35', 'size_stamp': 'स्टाम्प 20×25', 'size_us': 'US पासपोर्ट 2×2 in', 'size_schengen': 'UK / शेंगेन 35×45', 'size_custom': 'कस्टम…', 'restore_more': 'ज़्यादा वापस लाएँ', 'erase_more': 'ज़्यादा मिटाएँ', 'feather': 'किनारे की नरमी', 'edge_shift': 'किनारा अंदर/बाहर', 'bg_edge_title': 'किनारे की क्वालिटी — मास्क को नरम, बड़ा या छोटा करें।', 'text_strip_prompt': 'फोटो के नीचे पट्टी के लिए टेक्स्ट भेजें (नाम और तारीख), या वापस दबाएँ।', 'delete_data_confirm': 'इससे आपकी सेटिंग्स, प्रीसेट और सत्र मिट जाएँगे। पक्का करने के लिए फिर दबाएँ।', 'album_processing': '{n} फोटो संसाधित हो रही हैं — एक क्षण…'},
+}
 def load_locales() -> None:
-    for lang in LANGS:
-        p = LOCALE_DIR / f"{lang}.json"
-        _LOCALES[lang] = json.loads(p.read_text(encoding="utf-8"))
-
+    """Kept as a startup hook for compatibility; locales are embedded above."""
+    return None
 
 def t(lang: str, key: str, **kw) -> str:
-    s = _LOCALES.get(lang, _LOCALES.get(DEFAULT_LANG, {})).get(key)
-    if s is None:
-        s = _LOCALES.get(DEFAULT_LANG, {}).get(key, key)
-    return s.format(**kw) if kw else s
+    text = _LOCALES.get(lang, _LOCALES[DEFAULT_LANG]).get(key)
+    if text is None:
+        text = _LOCALES[DEFAULT_LANG].get(key, key)
+    try:
+        return text.format(**kw) if kw else text
+    except (KeyError, ValueError):
+        return text
+
+# ============================== SQLite storage ==============================
+
+# ---------------- bot/services/storage.py ----------------
+
+import json
+import time
+from typing import Any, Optional
+
+import aiosqlite
 
 
-# ========================================================================
-# STORAGE (SQLite): users, sessions, stats, file_id cache, presets
-# ========================================================================
 _db: Optional[aiosqlite.Connection] = None
 
 DEFAULT_RECIPE = {
@@ -162,9 +143,9 @@ def default_session() -> dict:
     }
 
 
-async def db_init() -> None:
+async def init() -> None:
     global _db
-    _db = await aiosqlite.connect(DB_PATH)
+    _db = await aiosqlite.connect(config.DB_PATH)
     await _db.executescript("""
     CREATE TABLE IF NOT EXISTS users(
       user_id INTEGER PRIMARY KEY, name TEXT, lang TEXT DEFAULT NULL,
@@ -179,7 +160,7 @@ async def db_init() -> None:
     await _db.commit()
 
 
-async def db_close() -> None:
+async def close() -> None:
     if _db:
         await _db.close()
 
@@ -195,7 +176,7 @@ async def upsert_user(uid: int, name: str) -> None:
 async def get_lang(uid: int) -> str:
     cur = await _db.execute("SELECT lang FROM users WHERE user_id=?", (uid,))
     row = await cur.fetchone()
-    return (row[0] if row and row[0] else None) or DEFAULT_LANG
+    return (row[0] if row and row[0] else None) or config.DEFAULT_LANG
 
 
 async def set_lang(uid: int, lang: str) -> None:
@@ -290,19 +271,25 @@ async def cache_put(key: str, file_id: str) -> None:
     await _db.execute(
         "INSERT OR REPLACE INTO file_cache(key,file_id) VALUES(?,?)", (key, file_id))
     await _db.commit()
+storage = SimpleNamespace(**{k: globals()[k] for k in ['DEFAULT_RECIPE', 'default_session', 'init', 'close', 'upsert_user', 'get_lang', 'set_lang', 'get_dpi', 'set_dpi', 'get_session', 'save_session', 'clear_session', 'save_preset', 'get_preset', 'delete_user_data', 'bump_stat', 'stats_today', 'all_user_ids', 'cache_get', 'cache_put'] if k in globals()})
+
+# ---------------- bot/services/queue.py ----------------
+
+import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Awaitable, Callable
 
 
-# ========================================================================
-# JOB QUEUE: global semaphore + per-user lock, CPU work off the event loop
-# ========================================================================
-_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="cv")
-_global_sem = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+_executor = ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_JOBS,
+                               thread_name_prefix="cv")
+_global = asyncio.Semaphore(config.MAX_CONCURRENT_JOBS)
 _user_locks: dict[int, asyncio.Lock] = {}
 _pending = 0
 
 
 def position_estimate() -> int:
-    return max(0, _pending - MAX_CONCURRENT_JOBS)
+    return max(0, _pending - config.MAX_CONCURRENT_JOBS)
 
 
 def user_lock(uid: int) -> asyncio.Lock:
@@ -310,11 +297,10 @@ def user_lock(uid: int) -> asyncio.Lock:
 
 
 async def run_cpu(fn: Callable, *args, **kwargs) -> Any:
-    """Run a blocking CPU function in the worker pool with a global limit."""
     global _pending
     _pending += 1
     try:
-        async with _global_sem:
+        async with _global:
             loop = asyncio.get_running_loop()
             call = functools.partial(fn, *args, **kwargs)
             return await loop.run_in_executor(_executor, call)
@@ -322,13 +308,19 @@ async def run_cpu(fn: Callable, *args, **kwargs) -> Any:
         _pending -= 1
 
 
-def queue_shutdown() -> None:
+def shutdown() -> None:
     _executor.shutdown(wait=False)
+queue = SimpleNamespace(**{k: globals()[k] for k in ['position_estimate', 'user_lock', 'run_cpu', 'shutdown'] if k in globals()})
 
+# ---------------- bot/services/face.py ----------------
 
-# ========================================================================
-# FACE DETECTION: MediaPipe if available, OpenCV Haar fallback
-# ========================================================================
+import math
+from typing import Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+
 _face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 _eye_cascade = cv2.CascadeClassifier(
@@ -347,7 +339,6 @@ def _to_cv(img: Image.Image) -> np.ndarray:
 
 
 def detect_faces(img: Image.Image) -> list[tuple[int, int, int, int]]:
-    """Return [(x, y, w, h)] largest first."""
     cv_img = _to_cv(img)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     if _mp is not None:
@@ -371,7 +362,6 @@ def detect_faces(img: Image.Image) -> list[tuple[int, int, int, int]]:
 
 
 def eye_line_angle(img: Image.Image) -> Optional[float]:
-    """Degrees the eye line deviates from horizontal; None if not found."""
     gray = cv2.cvtColor(_to_cv(img), cv2.COLOR_BGR2GRAY)
     faces = _face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
     if len(faces) == 0:
@@ -396,7 +386,6 @@ def straighten(img: Image.Image, angle: float) -> Image.Image:
 
 
 def draw_numbered(img: Image.Image, boxes) -> Image.Image:
-    """Preview with numbered boxes for multi-face selection."""
     out = img.convert("RGB").copy()
     arr = _to_cv(out)
     for i, (x, y, w, h) in enumerate(boxes, 1):
@@ -404,38 +393,40 @@ def draw_numbered(img: Image.Image, boxes) -> Image.Image:
         cv2.putText(arr, str(i), (x + 6, y + 40), cv2.FONT_HERSHEY_SIMPLEX,
                     1.4, (0, 200, 0), 4)
     return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+facesvc = SimpleNamespace(**{k: globals()[k] for k in ['_to_cv', 'detect_faces', 'eye_line_angle', 'straighten', 'draw_numbered'] if k in globals()})
+
+# ---------------- bot/services/background.py ----------------
+
+import cv2
+import numpy as np
+from PIL import Image
+
+_session = None
 
 
-# ========================================================================
-# BACKGROUND: removal + edge refinement + colour application
-# ========================================================================
-_rembg_session = None
-
-
-def _get_rembg_session():
-    global _rembg_session
-    if _rembg_session is None:
+def _get_session():
+    global _session
+    if _session is None:
         from rembg import new_session
         # u2net_human_seg is tuned for people; isnet is a good fallback
         try:
-            _rembg_session = new_session("u2net_human_seg")
+            _session = new_session("u2net_human_seg")
         except Exception:
-            _rembg_session = new_session("isnet-general-use")
-    return _rembg_session
+            _session = new_session("isnet-general-use")
+    return _session
 
 
-def bg_remove(img: Image.Image) -> tuple[Image.Image, Image.Image]:
-    """Return (cutout RGBA, mask L). Falls back to full-opacity mask."""
+def remove(img: Image.Image) -> tuple[Image.Image, Image.Image]:
     try:
         from rembg import remove as rembg_remove
-        out = rembg_remove(img, session=_get_rembg_session())
+        out = rembg_remove(img, session=_get_session())
         if out.mode != "RGBA":
             out = out.convert("RGBA")
         mask = out.getchannel("A")
         return out, mask
     except Exception:
         mask = Image.new("L", img.size, 255)
-        return _with_alpha(img, mask), mask
+        return img.convert("RGBA").putalpha(mask) or _with_alpha(img, mask)
 
 
 def _with_alpha(img: Image.Image, mask: Image.Image) -> Image.Image:
@@ -445,7 +436,6 @@ def _with_alpha(img: Image.Image, mask: Image.Image) -> Image.Image:
 
 
 def refine_mask(mask: Image.Image, feather: int = 2, shift: int = 0) -> Image.Image:
-    """Feather (blur radius px) and shift (grow/shrink edge, px)."""
     a = np.asarray(mask, dtype=np.uint8)
     if shift != 0:
         k = np.ones((3, 3), np.uint8)
@@ -460,8 +450,6 @@ def refine_mask(mask: Image.Image, feather: int = 2, shift: int = 0) -> Image.Im
 
 
 def decontaminate(img: Image.Image, mask: Image.Image) -> Image.Image:
-    """Pull semi-transparent edge pixels toward neutral so the old
-    background colour does not cling to hair and shoulders."""
     rgba = np.asarray(img.convert("RGBA"), dtype=np.float32)
     a = np.asarray(mask, dtype=np.float32) / 255.0
     edge = (a > 0.05) & (a < 0.95)
@@ -479,7 +467,6 @@ def decontaminate(img: Image.Image, mask: Image.Image) -> Image.Image:
 def apply_background(cutout: Image.Image, mask: Image.Image,
                      color_hex: str | None, bg_image: Image.Image | None = None,
                      transparent: bool = False) -> Image.Image:
-    """Composite cutout over colour / image / transparency."""
     w, h = cutout.size
     if transparent:
         base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -525,11 +512,14 @@ BG_PRESETS = {
     "bg_lightblue": "#BFE3F0", "bg_skyblue": "#87CEEB", "bg_red": "#D32F2F",
     "bg_yellow": "#FDD835", "bg_green": "#388E3C", "bg_black": "#111111",
 }
+bgsvc = SimpleNamespace(**{k: globals()[k] for k in ['_get_session', 'remove', '_with_alpha', 'refine_mask', 'decontaminate', 'apply_background', 'hex_to_rgb', 'valid_hex', 'average_colour', 'BG_PRESETS'] if k in globals()})
 
+# ---------------- bot/services/enhance.py ----------------
 
-# ========================================================================
-# ENHANCE: non-destructive recipe engine, re-applied to the source
-# ========================================================================
+import cv2
+import numpy as np
+from PIL import Image, ImageEnhance
+
 LOOKS = {
     "natural": {},
     "bright": {"brightness": 2, "contrast": 1, "saturation": 1},
@@ -539,7 +529,6 @@ LOOKS = {
 
 
 def apply_recipe(img: Image.Image, r: dict) -> Image.Image:
-    """Re-apply the full recipe to a source image. Every step is cheap."""
     out = img.convert("RGB")
     look = LOOKS.get(r.get("look", "natural"), {})
     merged = dict(r)
@@ -579,7 +568,7 @@ def apply_recipe(img: Image.Image, r: dict) -> Image.Image:
 
     if merged.get("glow", 0) > 0:
         n = merged["glow"]
-        blur = out.filter(ImageFilter.GaussianBlur(6 + 2 * n))
+        blur = out.filter(_gauss(6 + 2 * n))
         out = Image.blend(out, blur, min(0.25, 0.05 * n))
         out = ImageEnhance.Brightness(out).enhance(1.0 + 0.01 * n)
 
@@ -588,8 +577,12 @@ def apply_recipe(img: Image.Image, r: dict) -> Image.Image:
     return out
 
 
+def _gauss(radius: float):
+    from PIL import ImageFilter
+    return ImageFilter.GaussianBlur(radius)
+
+
 def auto_recipe(img: Image.Image) -> dict:
-    """Simple auto-enhance: lift dark images, tame bright ones."""
     gray = np.asarray(img.convert("L"), dtype=np.float32)
     mean = float(gray.mean())
     r: dict = {"denoise": 1, "sharpness": 1, "contrast": 1, "glow": 0,
@@ -605,7 +598,6 @@ def auto_recipe(img: Image.Image) -> dict:
 
 
 def quality_boost(img: Image.Image) -> Image.Image:
-    """Denoise + unsharp + gentle upscale for low-res inputs."""
     arr = np.asarray(img.convert("RGB"))
     arr = cv2.fastNlMeansDenoisingColored(arr, None, 4, 4, 7, 21)
     if min(arr.shape[:2]) < 600:
@@ -616,16 +608,20 @@ def quality_boost(img: Image.Image) -> Image.Image:
 
 
 def even_lighting(img: Image.Image) -> Image.Image:
-    """Flatten uneven face lighting (CLAHE on L channel)."""
     arr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2LAB)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     arr[..., 0] = clahe.apply(arr[..., 0])
     return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_LAB2RGB))
+ensvc = SimpleNamespace(**{k: globals()[k] for k in ['LOOKS', 'apply_recipe', '_gauss', 'auto_recipe', 'quality_boost', 'even_lighting'] if k in globals()})
+
+# ---------------- bot/services/layout.py ----------------
+
+import json
+from typing import Optional
+
+from PIL import Image, ImageDraw
 
 
-# ========================================================================
-# LAYOUT: size presets, paper sizes, grid math, sheet rendering
-# ========================================================================
 MM_PER_IN = 25.4
 
 SIZES: dict[str, tuple[float, float]] = {
@@ -650,9 +646,24 @@ def photo_px(mm: tuple[float, float], dpi: int) -> tuple[int, int]:
 
 def load_template() -> Optional[dict]:
     try:
-        return json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(config.TEMPLATE_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return None
+        return {
+            "name": "Indian Passport A4 Sheet",
+            "paper": "a4",
+            "paper_mm": [210, 297],
+            "photo_mm": [35, 45],
+            "dpi": 300,
+            "margin_top_mm": 10.0,
+            "margin_left_mm": 14.8,
+            "margin_right_mm": 14.8,
+            "margin_bottom_mm": 10.0,
+            "gap_x_mm": 2.0,
+            "gap_y_mm": 2.0,
+            "border_mm": 0.4,
+            "border_color": "#000000",
+            "cut_marks": False,
+        }
 
 
 def size_mm(sess: dict) -> tuple[float, float]:
@@ -671,7 +682,6 @@ def paper_mm(sess: dict) -> tuple[float, float]:
 
 def grid(paper: tuple[float, float], photo: tuple[float, float],
          margin: float, gap: float) -> tuple[int, int, float, float]:
-    """(cols, rows, used_x0, used_y0) centred on the page."""
     pw, ph = paper
     fw, fh = photo
     cols = int((pw - 2 * margin + gap) // (fw + gap))
@@ -702,7 +712,6 @@ def placements(paper, photo, margin, gap, copies: int) -> list[tuple[float, floa
 
 def render_sheet(photo_img: Image.Image, sess: dict, dpi: int = 300,
                  preview: bool = False) -> tuple[Image.Image, int]:
-    """Render the full sheet; returns (image, placed_count)."""
     paper = paper_mm(sess)
     photo = size_mm(sess)
     margin, gap = sess.get("margin", 5.0), sess.get("gap", 2.0)
@@ -743,37 +752,44 @@ def render_sheet(photo_img: Image.Image, sess: dict, dpi: int = 300,
         for y in range(0, sheet.height, step):
             draw.line([0, y, 6, y], fill="#999")
     return sheet, len(pos)
+layout = SimpleNamespace(**{k: globals()[k] for k in ['MM_PER_IN', 'SIZES', 'PAPERS', 'mm_to_px', 'photo_px', 'load_template', 'size_mm', 'paper_mm', 'grid', 'max_fit', 'placements', 'render_sheet'] if k in globals()})
+
+# ---------------- bot/services/pdf_export.py ----------------
+
+import io
+
+from PIL import Image
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas as rl_canvas
 
 
-# ========================================================================
-# PDF EXPORT: exact physical size, plus target-KB JPEG export
-# ========================================================================
+
 def sheet_pdf(photo_img: Image.Image, sess: dict) -> bytes:
-    """Exact-size PDF: 35x45 mm photos measure 35x45 mm at 100% print."""
-    paper = paper_mm(sess)
-    photo = size_mm(sess)
+    paper = layout.paper_mm(sess)
+    photo = layout.size_mm(sess)
     buf = io.BytesIO()
-    c = rl_canvas.Canvas(buf, pagesize=(paper[0] * RL_MM, paper[1] * RL_MM))
-    pos = placements(paper, photo, sess.get("margin", 5.0),
-                     sess.get("gap", 2.0), sess.get("copies", 8))
+    c = rl_canvas.Canvas(buf, pagesize=(paper[0] * mm, paper[1] * mm))
+    pos = layout.placements(paper, photo, sess.get("margin", 5.0),
+                            sess.get("gap", 2.0), sess.get("copies", 8))
     reader = ImageReader(photo_img.convert("RGB"))
     for x_mm, y_mm in pos:
         # reportlab origin is bottom-left
-        c.drawImage(reader, x_mm * RL_MM,
-                    (paper[1] - y_mm - photo[1]) * RL_MM,
-                    width=photo[0] * RL_MM, height=photo[1] * RL_MM)
+        c.drawImage(reader, x_mm * mm,
+                    (paper[1] - y_mm - photo[1]) * mm,
+                    width=photo[0] * mm, height=photo[1] * mm)
         if sess.get("border"):
-            c.setLineWidth(0.4 * RL_MM)
-            c.rect(x_mm * RL_MM, (paper[1] - y_mm - photo[1]) * RL_MM,
-                   photo[0] * RL_MM, photo[1] * RL_MM)
+            c.setLineWidth(0.4 * mm)
+            c.rect(x_mm * mm, (paper[1] - y_mm - photo[1]) * mm,
+                   photo[0] * mm, photo[1] * mm)
         if sess.get("cut_marks"):
-            c.setLineWidth(0.2 * RL_MM)
+            c.setLineWidth(0.2 * mm)
             for cx, cy in ((x_mm, y_mm), (x_mm + photo[0], y_mm),
                            (x_mm, y_mm + photo[1]),
                            (x_mm + photo[0], y_mm + photo[1])):
                 ry = paper[1] - cy
-                c.line((cx - 3) * RL_MM, ry * RL_MM, (cx + 3) * RL_MM, ry * RL_MM)
-                c.line(cx * RL_MM, (ry - 3) * RL_MM, cx * RL_MM, (ry + 3) * RL_MM)
+                c.line((cx - 3) * mm, ry * mm, (cx + 3) * mm, ry * mm)
+                c.line(cx * mm, (ry - 3) * mm, cx * mm, (ry + 3) * mm)
     c.showPage()
     c.save()
     return buf.getvalue()
@@ -781,7 +797,6 @@ def sheet_pdf(photo_img: Image.Image, sess: dict) -> bytes:
 
 def to_jpeg_target_kb(img: Image.Image, target_kb: int,
                       tolerance: float = 0.15) -> tuple[bytes, int]:
-    """Compress JPEG to fit under target_kb; returns (bytes, actual_kb)."""
     lo, hi = 20, 95
     best = b""
     work = img.convert("RGB")
@@ -807,14 +822,17 @@ def to_jpeg_target_kb(img: Image.Image, target_kb: int,
         work.save(buf, "JPEG", quality=85, optimize=True)
         best, kb = buf.getvalue(), buf.tell() // 1024
     return best, kb
+pdf_export = SimpleNamespace(**{k: globals()[k] for k in ['sheet_pdf', 'to_jpeg_target_kb'] if k in globals()})
+
+# ---------------- bot/services/compliance.py ----------------
+
+import numpy as np
+from PIL import Image
 
 
-# ========================================================================
-# COMPLIANCE: produces the preview-card checklist
-# ========================================================================
-def compliance_check(photo: Image.Image, face_box, mm_size: tuple[float, float],
-                     orig_px: tuple[int, int], dpi: int) -> list[tuple[str, str]]:
-    """Return list of (check_key, status) with status in ok|warn|fail."""
+
+def check(photo: Image.Image, face_box, mm_size: tuple[float, float],
+          orig_px: tuple[int, int], dpi: int) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     w, h = photo.size
     if face_box:
@@ -835,7 +853,7 @@ def compliance_check(photo: Image.Image, face_box, mm_size: tuple[float, float],
     arr = np.asarray(photo.convert("RGB"), dtype=np.int16)
     gray = arr.mean(axis=2)
     # tilt: re-detect eyes on the crop
-    eyes = eye_line_angle(photo) if face_box else None
+    eyes = facesvc.eye_line_angle(photo) if face_box else None
     if eyes is None:
         out.append(("check_tilt", "warn"))
     else:
@@ -869,54 +887,62 @@ def compliance_check(photo: Image.Image, face_box, mm_size: tuple[float, float],
     return out
 
 
-COMPLIANCE_ICON = {"ok": "✅", "warn": "⚠️", "fail": "❌"}
+ICON = {"ok": "✅", "warn": "⚠️", "fail": "❌"}
 
 
-def compliance_render_text(checks: list[tuple[str, str]], t_func) -> str:
-    return "   ".join(f"{COMPLIANCE_ICON[s]} {t_func(k)}" for k, s in checks)
+def render_text(checks: list[tuple[str, str]], t_func) -> str:
+    return "   ".join(f"{ICON[s]} {t_func(k)}" for k, s in checks)
+compliance = SimpleNamespace(**{k: globals()[k] for k in ['check', 'ICON', 'render_text'] if k in globals()})
+
+# ---------------- bot/services/pipeline.py ----------------
+
+import time
+from pathlib import Path
+
+import pillow_heif
+from PIL import Image, ImageDraw, ImageOps
 
 
-# ========================================================================
-# PIPELINE: automatic processing + preview/final rendering
-# ========================================================================
-PHOTO_ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+pillow_heif.register_heif_opener()
+
+ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 
 
 def load_photo(path: str | Path) -> Image.Image:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)
-    if img.width * img.height > MAX_PIXELS:
+    if img.width * img.height > config.MAX_PIXELS:
         raise ValueError("image too large")
     return img.convert("RGB")
 
 
-def working_copy(img: Image.Image, px: int = WORKING_PX) -> Image.Image:
+def working_copy(img: Image.Image, px: int = config.WORKING_PX) -> Image.Image:
     img = img.copy()
     img.thumbnail((px, px), Image.LANCZOS)
     return img
 
 
 def auto_process(sess: dict, uid_dir: Path) -> dict:
-    """Full auto pipeline on the working copy. Mutates and returns session."""
     t0 = time.time()
     work = Image.open(sess["work"]).convert("RGB")
 
-    angle = eye_line_angle(work)
+    angle = facesvc.eye_line_angle(work)
     if angle:
-        work = straighten(work, angle)
+        work = facesvc.straighten(work, angle)
 
-    boxes = detect_faces(work)
-    sess["face"] = boxes[0] if boxes else None
+    boxes = facesvc.detect_faces(work)
+    if not sess.get("face"):
+        sess["face"] = boxes[0] if boxes else None
 
     if boxes:
-        cutout, mask = bg_remove(work)
+        cutout, mask = bgsvc.remove(work)
         sess["has_bg_removed"] = True
     else:
         cutout, mask = work.convert("RGBA"), Image.new("L", work.size, 255)
         sess["has_bg_removed"] = False
 
     edge = sess.get("edge", {"feather": 2, "shift": 0})
-    mask = refine_mask(mask, edge.get("feather", 2), edge.get("shift", 0))
+    mask = bgsvc.refine_mask(mask, edge.get("feather", 2), edge.get("shift", 0))
     mask.save(uid_dir / "mask.png")
     sess["mask"] = str(uid_dir / "mask.png")
     cutout.convert("RGB").save(uid_dir / "cutout.png")
@@ -925,7 +951,7 @@ def auto_process(sess: dict, uid_dir: Path) -> dict:
     sess["aligned"] = str(uid_dir / "aligned.png")
 
     if not sess["history"]:
-        auto = auto_recipe(work)
+        auto = ensvc.auto_recipe(work)
         auto.update({k: v for k, v in sess["recipe"].items() if v not in (0, "natural")})
         sess["recipe"] = auto
         sess["history"] = [dict(auto)]
@@ -934,9 +960,9 @@ def auto_process(sess: dict, uid_dir: Path) -> dict:
     return sess
 
 
-def crop_to_standard(img: Image.Image, sess: dict, face_box) -> Image.Image:
-    """Crop to preset aspect ratio, centred on face + user crop offsets."""
-    mm = size_mm(sess)
+def crop_to_standard(img: Image.Image, sess: dict,
+                     face_box) -> Image.Image:
+    mm = layout.size_mm(sess)
     aspect = mm[0] / mm[1]
     w, h = img.size
     crop = sess.get("crop", {})
@@ -962,7 +988,6 @@ def crop_to_standard(img: Image.Image, sess: dict, face_box) -> Image.Image:
 
 
 def render_preview(sess: dict, guides: bool = False) -> Image.Image:
-    """Fast preview from working copy: cutout -> bg -> enhance -> crop -> guides."""
     cutout = Image.open(sess["cutout"]).convert("RGBA")
     mask = Image.open(sess["mask"])
     face = sess.get("face")
@@ -973,12 +998,12 @@ def render_preview(sess: dict, guides: bool = False) -> Image.Image:
     if crop.get("flip"):
         cutout = ImageOps.mirror(cutout)
         mask = ImageOps.mirror(mask)
-    base = apply_background(
+    base = bgsvc.apply_background(
         cutout, mask, sess.get("bg"),
         transparent=sess.get("transparent", False))
-    base = apply_recipe(base.convert("RGB"), sess["recipe"])
+    base = ensvc.apply_recipe(base.convert("RGB"), sess["recipe"])
     base = crop_to_standard(base, sess, face)
-    px = photo_px(size_mm(sess), 300)
+    px = layout.photo_px(layout.size_mm(sess), 300)
     base = base.resize((px[0] // 2, px[1] // 2), Image.LANCZOS)
     if guides or crop.get("guides"):
         d = ImageDraw.Draw(base)
@@ -991,7 +1016,6 @@ def render_preview(sess: dict, guides: bool = False) -> Image.Image:
 
 
 def render_final(sess: dict) -> Image.Image:
-    """Full-resolution export from the ORIGINAL: same recipe at export DPI."""
     uid_dir = Path(sess["work"]).parent
     orig = Image.open(sess["orig"]).convert("RGB")
     aligned_path = sess.get("aligned")
@@ -1003,13 +1027,13 @@ def render_final(sess: dict) -> Image.Image:
     cutout_full = uid_dir / "cutout_full.png"
     mask_full = uid_dir / "mask_full.png"
     if not cutout_full.exists():
-        angle = eye_line_angle(orig)
+        angle = facesvc.eye_line_angle(orig)
         if angle:
-            orig = straighten(orig, angle)
-        cutout, mask = bg_remove(orig)
+            orig = facesvc.straighten(orig, angle)
+        cutout, mask = bgsvc.remove(orig)
         edge = sess.get("edge", {"feather": 2, "shift": 0})
-        mask = refine_mask(mask, int(edge.get("feather", 2) * scale),
-                           int(edge.get("shift", 0) * scale))
+        mask = bgsvc.refine_mask(mask, int(edge.get("feather", 2) * scale),
+                                 int(edge.get("shift", 0) * scale))
         cutout.convert("RGB").save(cutout_full)
         mask.save(mask_full)
     cutout = Image.open(cutout_full).convert("RGBA")
@@ -1021,15 +1045,15 @@ def render_final(sess: dict) -> Image.Image:
     if crop.get("flip"):
         cutout = ImageOps.mirror(cutout)
         mask = ImageOps.mirror(mask)
-    base = apply_background(cutout, mask, sess.get("bg"),
-                            transparent=sess.get("transparent", False))
-    base = apply_recipe(base.convert("RGB"), sess["recipe"])
+    base = bgsvc.apply_background(cutout, mask, sess.get("bg"),
+                                  transparent=sess.get("transparent", False))
+    base = ensvc.apply_recipe(base.convert("RGB"), sess["recipe"])
     face = sess.get("face")
     if face:
         face = [int(v * scale) for v in face]
     base = crop_to_standard(base, sess, face)
     dpi = sess.get("dpi") or 300
-    base = base.resize(photo_px(size_mm(sess), dpi), Image.LANCZOS)
+    base = base.resize(layout.photo_px(layout.size_mm(sess), dpi), Image.LANCZOS)
     return base
 
 
@@ -1043,11 +1067,50 @@ def compare_image(sess: dict) -> Image.Image:
     out.paste(o, (0, 0))
     out.paste(p, (o.width + 10, 0))
     return out
+pipeline = SimpleNamespace(**{k: globals()[k] for k in ['ALLOWED', 'load_photo', 'working_copy', 'auto_process', 'crop_to_standard', 'render_preview', 'render_final', 'compare_image'] if k in globals()})
+
+# ---------------- bot/states.py ----------------
+
+import json
+from pathlib import Path
+
+from aiogram.fsm.state import State, StatesGroup
 
 
-# ========================================================================
-# KEYBOARDS: all inline keyboards. Compact CallbackData keeps payload small.
-# ========================================================================
+
+class Flow(StatesGroup):
+    waiting_language = State()
+    waiting_custom_size = State()
+    waiting_custom_colour = State()
+    waiting_copies = State()
+    waiting_text_strip = State()
+    waiting_broadcast = State()
+    waiting_face_pick = State()
+    waiting_manual_crop = State()
+
+
+_LOCALES: dict[str, dict] = {}
+
+
+def load_locales() -> None:
+    for lang in config.LANGS:
+        p = Path(__file__).parent / "locale" / f"{lang}.json"
+        _LOCALES[lang] = json.loads(p.read_text(encoding="utf-8"))
+
+
+def t(lang: str, key: str, **kw) -> str:
+    s = _LOCALES.get(lang, _LOCALES[config.DEFAULT_LANG]).get(key)
+    if s is None:
+        s = _LOCALES[config.DEFAULT_LANG].get(key, key)
+    return s.format(**kw) if kw else s
+
+# ---------------- bot/keyboards.py ----------------
+
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
 class Cb(CallbackData, prefix="c"):
     a: str          # action
     v: str = ""     # value
@@ -1196,10 +1259,17 @@ def noface_kb(t) -> InlineKeyboardMarkup:
     b.row(btn(t("manual_crop"), "face", "manual"))
     return b.as_markup()
 
+# ---------------- bot/middlewares.py ----------------
 
-# ========================================================================
-# MIDDLEWARES: flood protection, user bootstrap, lang injection, errors
-# ========================================================================
+import time
+from collections import defaultdict, deque
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware
+from aiogram.types import CallbackQuery, Message, TelegramObject
+
+
+
 class FloodMiddleware(BaseMiddleware):
     def __init__(self) -> None:
         self._hits: dict[int, deque] = defaultdict(deque)
@@ -1210,9 +1280,9 @@ class FloodMiddleware(BaseMiddleware):
             return await handler(event, data)
         now = time.monotonic()
         q = self._hits[user.id]
-        while q and now - q[0] > FLOOD_WINDOW_S:
+        while q and now - q[0] > config.FLOOD_WINDOW_S:
             q.popleft()
-        if len(q) >= FLOOD_MAX_EVENTS:
+        if len(q) >= config.FLOOD_MAX_EVENTS:
             if isinstance(event, CallbackQuery):
                 await event.answer()
             return None
@@ -1221,15 +1291,14 @@ class FloodMiddleware(BaseMiddleware):
 
 
 class UserMiddleware(BaseMiddleware):
-    """Ensure user row exists, inject lang into handler data."""
 
     async def __call__(self, handler, event: TelegramObject, data: dict) -> Any:
         user = data.get("event_from_user")
         if user is not None:
-            await upsert_user(user.id, user.full_name)
-            data["lang"] = await get_lang(user.id)
+            await storage.upsert_user(user.id, user.full_name)
+            data["lang"] = await storage.get_lang(user.id)
         else:
-            data["lang"] = DEFAULT_LANG
+            data["lang"] = config.DEFAULT_LANG
         return await handler(event, data)
 
 
@@ -1238,138 +1307,147 @@ class ErrorMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception:
+            import logging, traceback
             logging.getLogger("bot").exception("handler error")
-            await bump_stat(errors=1)
+            await storage.bump_stat(errors=1)
             bot = data.get("bot")
-            lang = data.get("lang", DEFAULT_LANG)
+            lang = data.get("lang", config.DEFAULT_LANG)
             try:
                 if isinstance(event, CallbackQuery):
                     await event.answer(t(lang, "error_generic"), show_alert=True)
                 elif isinstance(event, Message):
                     await event.answer(t(lang, "error_generic"))
-                if bot and ADMIN_IDS:
+                if bot and config.ADMIN_IDS:
                     tb = traceback.format_exc()[-3500:]
-                    for aid in ADMIN_IDS:
+                    for aid in config.ADMIN_IDS:
                         await bot.send_message(aid, f"⚠️ Handler error:\n<pre>{tb}</pre>")
             except Exception:
                 pass
             return None
 
+router = Router()
 
-# ========================================================================
-# HANDLERS: core commands — /start /help /settings /language /privacy
-#           /reset /cancel + admin commands
-# ========================================================================
-core_router = Router()
+# ---------------- bot/handlers/core.py ----------------
+
+import shutil
+from pathlib import Path
+
+from aiogram import F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message
 
 
-@core_router.message(CommandStart())
+
+
+
+@router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext, lang: str):
-    await upsert_user(m.from_user.id, m.from_user.full_name)
-    cur = await get_lang(m.from_user.id)
+    await storage.upsert_user(m.from_user.id, m.from_user.full_name)
+    cur = await storage.get_lang(m.from_user.id)
     # First-ever start: language pick. After that: welcome directly.
-    sess = await get_session(m.from_user.id)
-    if not sess.get("card_msg") and cur == DEFAULT_LANG:
+    sess = await storage.get_session(m.from_user.id)
+    if not sess.get("card_msg") and cur == config.DEFAULT_LANG:
         await state.set_state(Flow.waiting_language)
         await m.answer(t("en", "choose_language"), reply_markup=lang_kb())
     else:
         await m.answer(t(cur, "welcome"))
-        await m.answer(t(cur, "privacy_note", ttl=TEMP_TTL_MINUTES))
+        await m.answer(t(cur, "privacy_note", ttl=config.TEMP_TTL_MINUTES))
 
 
-@core_router.callback_query(Cb.filter(F.a == "lang"))
-async def lang_pick(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(Cb.filter(F.a == "lang"))
+async def lang_pick(cb, state: FSMContext):
     data = Cb.unpack(cb.data)
-    await set_lang(cb.from_user.id, data.v)
+    await storage.set_lang(cb.from_user.id, data.v)
     await state.clear()
     lang = data.v
     await cb.message.edit_text(t(lang, "welcome"))
-    await cb.message.answer(t(lang, "privacy_note", ttl=TEMP_TTL_MINUTES))
+    await cb.message.answer(t(lang, "privacy_note", ttl=config.TEMP_TTL_MINUTES))
     await cb.answer()
 
 
-@core_router.message(Command("help"))
+@router.message(Command("help"))
 async def cmd_help(m: Message, lang: str):
     await m.answer(t(lang, "help"))
 
 
-@core_router.message(Command("language"))
+@router.message(Command("language"))
 async def cmd_language(m: Message, state: FSMContext):
     await state.set_state(Flow.waiting_language)
     await m.answer(t("en", "choose_language"), reply_markup=lang_kb())
 
 
-@core_router.message(Command("privacy"))
+@router.message(Command("privacy"))
 async def cmd_privacy(m: Message, lang: str):
-    await m.answer(t(lang, "privacy_full", ttl=TEMP_TTL_MINUTES))
+    await m.answer(t(lang, "privacy_full", ttl=config.TEMP_TTL_MINUTES))
 
 
-@core_router.message(Command("reset"))
+@router.message(Command("reset"))
 async def cmd_reset(m: Message, lang: str):
-    sess = await get_session(m.from_user.id)
-    d = default_session()
+    sess = await storage.get_session(m.from_user.id)
+    d = storage.default_session()
     for k in ("orig", "work", "mask", "cutout", "aligned", "face",
               "card_msg", "sheet_msg"):
         d[k] = sess.get(k)
     d["copies"], d["paper"] = sess["copies"], sess["paper"]
-    await save_session(m.from_user.id, d)
+    await storage.save_session(m.from_user.id, d)
     await m.answer(t(lang, "reset_done"))
 
 
-@core_router.message(Command("cancel"))
+@router.message(Command("cancel"))
 async def cmd_cancel(m: Message, state: FSMContext, lang: str):
     await state.clear()
     await _wipe_files(m.from_user.id)
-    await clear_session(m.from_user.id)
+    await storage.clear_session(m.from_user.id)
     await m.answer(t(lang, "session_cleared"))
 
 
 async def _wipe_files(uid: int) -> None:
-    d = TEMP_DIR / str(uid)
+    d = config.TEMP_DIR / str(uid)
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
 
 
-@core_router.message(Command("settings"))
+@router.message(Command("settings"))
 async def cmd_settings(m: Message, lang: str):
-    dpi = await get_dpi(m.from_user.id)
+    dpi = await storage.get_dpi(m.from_user.id)
     await m.answer(t(lang, "settings_title"), reply_markup=settings_menu(
         lambda k, **kw: t(lang, k, **kw), dpi))
 
 
 # ---- admin ----
 
-@core_router.message(Command("stats"))
+@router.message(Command("stats"))
 async def cmd_stats(m: Message, lang: str):
-    if m.from_user.id not in ADMIN_IDS:
+    if m.from_user.id not in config.ADMIN_IDS:
         return await m.answer(t(lang, "admin_only"))
-    s = await stats_today()
+    s = await storage.stats_today()
     await m.answer(t(lang, "admin_stats", **s))
 
 
-@core_router.message(Command("health"))
+@router.message(Command("health"))
 async def cmd_health(m: Message, lang: str):
-    if m.from_user.id not in ADMIN_IDS:
+    if m.from_user.id not in config.ADMIN_IDS:
         return await m.answer(t(lang, "admin_only"))
-    n = len(list(TEMP_DIR.glob("**/*"))) if TEMP_DIR.exists() else 0
-    await m.answer(t(lang, "admin_health", q=position_estimate(), t=n))
+    n = len(list(config.TEMP_DIR.glob("**/*"))) if config.TEMP_DIR.exists() else 0
+    await m.answer(t(lang, "admin_health", q=queue.position_estimate(), t=n))
 
 
-@core_router.message(Command("broadcast"))
+@router.message(Command("broadcast"))
 async def cmd_broadcast(m: Message, state: FSMContext, lang: str):
-    if m.from_user.id not in ADMIN_IDS:
+    if m.from_user.id not in config.ADMIN_IDS:
         return await m.answer(t(lang, "admin_only"))
     await state.set_state(Flow.waiting_broadcast)
     await m.answer(t(lang, "broadcast_prompt"))
 
 
-@core_router.message(Flow.waiting_broadcast)
+@router.message(Flow.waiting_broadcast)
 async def do_broadcast(m: Message, state: FSMContext, lang: str):
-    if m.from_user.id not in ADMIN_IDS:
+    if m.from_user.id not in config.ADMIN_IDS:
         return
     await state.clear()
     ok = 0
-    for uid in await all_user_ids():
+    for uid in await storage.all_user_ids():
         try:
             await m.copy_to(uid)
             ok += 1
@@ -1377,35 +1455,42 @@ async def do_broadcast(m: Message, state: FSMContext, lang: str):
             pass
     await m.answer(t(lang, "broadcast_done", n=ok))
 
+# ---------------- bot/handlers/photo.py ----------------
 
-# ========================================================================
-# HANDLERS: photo intake + auto pipeline + preview card
-# ========================================================================
-photo_router = Router()
+import io
+import time
+from pathlib import Path
+
+from aiogram import Bot, F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.types import (BufferedInputFile, InputMediaPhoto, Message)
+
+
+
 
 EXT_OK = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 
 
 def uid_dir(uid: int) -> Path:
-    d = TEMP_DIR / str(uid)
+    d = config.TEMP_DIR / str(uid)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 async def _download(bot: Bot, file_id: str, dest: Path) -> bool:
     f = await bot.get_file(file_id)
-    if f.file_size and f.file_size > MAX_FILE_BYTES:
+    if f.file_size and f.file_size > config.MAX_FILE_BYTES:
         return False
     await bot.download_file(f.file_path, dest)
     return True
 
 
-@photo_router.message(lambda m: m.photo or (m.document and m.document.mime_type
+@router.message(lambda m: m.photo or (m.document and m.document.mime_type
                 and (m.document.mime_type.startswith("image/")
                      or m.document.mime_type == "application/octet-stream")))
 async def on_photo(m: Message, bot: Bot, state: FSMContext, lang: str):
     uid = m.from_user.id
-    lock = user_lock(uid)
+    lock = queue.user_lock(uid)
     if lock.locked():
         await m.answer(t(lang, "queue_position", n=1))
     async with lock:
@@ -1425,31 +1510,31 @@ async def on_photo(m: Message, bot: Bot, state: FSMContext, lang: str):
             await progress.edit_text(t(lang, "file_too_large"))
             return
 
-        sess = default_session()
-        sess["dpi"] = await get_dpi(uid)
+        sess = storage.default_session()
+        sess["dpi"] = await storage.get_dpi(uid)
         # reuse preset if one exists
-        preset = await get_preset(uid)
+        preset = await storage.get_preset(uid)
         if preset:
             sess.update({k: v for k, v in preset.items() if k in sess})
 
         try:
-            img = await run_cpu(load_photo, raw)
+            img = await queue.run_cpu(pipeline.load_photo, raw)
         except Exception:
             await progress.edit_text(t(lang, "bad_file_type"))
             return
         orig_path = d / "orig_rgb.png"
         work_path = d / "work.png"
-        await run_cpu(_save_variants, img, orig_path, work_path)
+        await queue.run_cpu(_save_variants, img, orig_path, work_path)
         sess["orig"], sess["work"] = str(orig_path), str(work_path)
 
         await progress.edit_text(t(lang, "stage_face"))
-        work_img = await run_cpu(lambda: Image.open(work_path).convert("RGB"))
-        faces = await run_cpu(detect_faces, work_img)
+        work_img = await queue.run_cpu(lambda: __import__("PIL.Image", fromlist=["Image"]).open(work_path).convert("RGB"))
+        faces = await queue.run_cpu(facesvc.detect_faces, work_img)
 
         if len(faces) > 1 and not m.media_group_id:
             sess["pending_faces"] = faces
-            await save_session(uid, sess)
-            numbered = await run_cpu(draw_numbered, work_img, faces)
+            await storage.save_session(uid, sess)
+            numbered = await queue.run_cpu(facesvc.draw_numbered, work_img, faces)
             buf = io.BytesIO(); numbered.save(buf, "PNG")
             await state.set_state(Flow.waiting_face_pick)
             await progress.delete()
@@ -1460,9 +1545,9 @@ async def on_photo(m: Message, bot: Bot, state: FSMContext, lang: str):
 
         await progress.edit_text(t(lang, "stage_bg"))
         t0 = time.time()
-        sess = await run_cpu(auto_process, sess, d)
-        await save_session(uid, sess)
-        await bump_stat(jobs=1, ms=int((time.time() - t0) * 1000))
+        sess = await queue.run_cpu(pipeline.auto_process, sess, d)
+        await storage.save_session(uid, sess)
+        await storage.bump_stat(jobs=1, ms=int((time.time() - t0) * 1000))
 
         if not sess.get("face"):
             await progress.delete()
@@ -1476,24 +1561,24 @@ async def on_photo(m: Message, bot: Bot, state: FSMContext, lang: str):
 
 def _save_variants(img, orig_path: Path, work_path: Path):
     img.save(orig_path)
-    working_copy(img).save(work_path)
+    pipeline.working_copy(img).save(work_path)
 
 
 async def build_caption(uid: int, sess: dict, lang) -> str:
     tf = lambda k, **kw: t(lang, k, **kw)
-    mm = size_mm(sess)
-    preview = await run_cpu(render_preview, sess)
+    mm = layout.size_mm(sess)
+    preview = await queue.run_cpu(pipeline.render_preview, sess)
     face = sess.get("face")
     if face and sess.get("work"):
         # scale face box to preview coords
-        work = Image.open(sess["work"])
+        work = __import__("PIL.Image", fromlist=["Image"]).open(sess["work"])
         sx = preview.width / (work.width / 2)
         face_p = [int(v * sx / 2) for v in face]
     else:
         face_p = None
-    orig_px = Image.open(sess["orig"]).size
-    checks = await run_cpu(compliance_check, preview, face_p, mm,
-                           orig_px, sess.get("dpi") or 300)
+    orig_px = __import__("PIL.Image", fromlist=["Image"]).open(sess["orig"]).size
+    checks = await queue.run_cpu(compliance.check, preview, face_p, mm,
+                                 orig_px, sess.get("dpi") or 300)
     bg_name = sess.get("bg", "#FFFFFF")
     for k, v in BG_PRESETS.items():
         if v == bg_name:
@@ -1506,13 +1591,13 @@ async def build_caption(uid: int, sess: dict, lang) -> str:
                w=mm[0], h=mm[1], dpi=sess.get("dpi") or 300,
                bg=bg_name, glow=sess["recipe"].get("glow", 0),
                copies=sess["copies"], paper=sess["paper"].upper())
-    return title + "\n" + compliance_render_text(checks, tf)
+    return title + "\n" + compliance.render_text(checks, tf)
 
 
 async def send_card(m_or_cb, uid: int, lang: str, progress=None):
-    sess = await get_session(uid)
+    sess = await storage.get_session(uid)
     tf = lambda k, **kw: t(lang, k, **kw)
-    preview = await run_cpu(render_preview, sess)
+    preview = await queue.run_cpu(pipeline.render_preview, sess)
     buf = io.BytesIO(); preview.save(buf, "PNG")
     photo = BufferedInputFile(buf.getvalue(), "preview.png")
     caption = await build_caption(uid, sess, lang)
@@ -1536,20 +1621,20 @@ async def send_card(m_or_cb, uid: int, lang: str, progress=None):
     sent = await bot.send_photo(chat_id, photo, caption=caption,
                                 parse_mode="HTML", reply_markup=kb)
     sess["card_msg"] = sent.message_id
-    await save_session(uid, sess)
+    await storage.save_session(uid, sess)
 
 
-@photo_router.callback_query(Cb.filter(F.a == "face"))
-async def pick_face(cb: CallbackQuery, state: FSMContext, lang: str):
+@router.callback_query(Cb.filter(F.a == "face"))
+async def pick_face(cb, state: FSMContext, lang: str):
     data = Cb.unpack(cb.data)
     uid = cb.from_user.id
     await cb.answer()
-    sess = await get_session(uid)
+    sess = await storage.get_session(uid)
     if data.v == "manual":
         await state.set_state(Flow.waiting_manual_crop)
         sess["face"] = None
-        sess = await run_cpu(auto_process, sess, uid_dir(uid))
-        await save_session(uid, sess)
+        sess = await queue.run_cpu(pipeline.auto_process, sess, uid_dir(uid))
+        await storage.save_session(uid, sess)
         await send_card(cb, uid, lang)
         return
     idx = int(data.v)
@@ -1558,16 +1643,22 @@ async def pick_face(cb: CallbackQuery, state: FSMContext, lang: str):
         sess["face"] = tuple(faces[idx])
     sess.pop("pending_faces", None)
     await state.clear()
-    sess = await run_cpu(auto_process, sess, uid_dir(uid))
-    await save_session(uid, sess)
+    sess = await queue.run_cpu(pipeline.auto_process, sess, uid_dir(uid))
+    await storage.save_session(uid, sess)
     await send_card(cb, uid, lang)
 
+# ---------------- bot/handlers/menu.py ----------------
 
-# ========================================================================
-# HANDLERS: all fine-tune menus — size, background, enhance, crop, sheet,
-#           export, settings
-# ========================================================================
-menu_router = Router()
+import io
+import re
+import shutil
+
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
+
+
+
 
 
 def tf_of(lang):
@@ -1575,11 +1666,11 @@ def tf_of(lang):
 
 
 async def _sess(uid):
-    return await get_session(uid)
+    return await storage.get_session(uid)
 
 
 async def _save_refresh(cb: CallbackQuery, sess: dict, lang: str):
-    await save_session(cb.from_user.id, sess)
+    await storage.save_session(cb.from_user.id, sess)
     await send_card(cb, cb.from_user.id, lang)
 
 
@@ -1591,12 +1682,12 @@ def _push_history(sess: dict):
     sess["hpos"] = len(sess["history"]) - 1
 
 
-@menu_router.callback_query(Cb.filter(F.a == "noop"))
+@router.callback_query(Cb.filter(F.a == "noop"))
 async def noop(cb: CallbackQuery):
     await cb.answer()
 
 
-@menu_router.callback_query(Cb.filter(F.a == "menu"))
+@router.callback_query(Cb.filter(F.a == "menu"))
 async def open_menu(cb: CallbackQuery, lang: str):
     tf = tf_of(lang)
     sess = await _sess(cb.from_user.id)
@@ -1611,7 +1702,7 @@ async def open_menu(cb: CallbackQuery, lang: str):
     elif v == "enh":
         await cb.message.edit_reply_markup(reply_markup=enhance_menu(tf, sess["recipe"]))
     elif v == "crop":
-        mm = size_mm(sess)
+        mm = layout.size_mm(sess)
         await cb.message.edit_caption(
             caption=tf("crop_title", size=f"{mm[0]}×{mm[1]} mm"), parse_mode="HTML",
             reply_markup=crop_menu(tf, sess))
@@ -1621,7 +1712,7 @@ async def open_menu(cb: CallbackQuery, lang: str):
         await cb.message.edit_reply_markup(reply_markup=download_menu(tf))
 
 
-@menu_router.callback_query(Cb.filter(F.a == "size"))
+@router.callback_query(Cb.filter(F.a == "size"))
 async def pick_size(cb: CallbackQuery, state: FSMContext, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
@@ -1636,7 +1727,7 @@ async def pick_size(cb: CallbackQuery, state: FSMContext, lang: str):
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)\s*(mm|cm|in|inch|px)?\s*$", re.I)
 
 
-@menu_router.message(Flow.waiting_custom_size)
+@router.message(Flow.waiting_custom_size)
 async def custom_size(m: Message, state: FSMContext, lang: str):
     g = _SIZE_RE.match(m.text or "")
     if not g:
@@ -1653,11 +1744,11 @@ async def custom_size(m: Message, state: FSMContext, lang: str):
     await state.clear()
     sess = await _sess(m.from_user.id)
     sess["size"], sess["custom_mm"] = "custom", [w, h]
-    await save_session(m.from_user.id, sess)
+    await storage.save_session(m.from_user.id, sess)
     await send_card(m, m.from_user.id, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "bg"))
+@router.callback_query(Cb.filter(F.a == "bg"))
 async def pick_bg(cb: CallbackQuery, state: FSMContext, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
@@ -1671,22 +1762,23 @@ async def pick_bg(cb: CallbackQuery, state: FSMContext, lang: str):
         sess["bg"], sess["transparent"] = "#FFFFFF", False
         sess["edge"] = {"feather": 2, "shift": 0}
     else:
-        sess["bg"] = BG_PRESETS[v]
+        sess["bg"] = bgsvc.BG_PRESETS[v]
         sess["transparent"] = False
     await _save_refresh(cb, sess, lang)
 
 
-@menu_router.message(Flow.waiting_custom_colour)
+@router.message(Flow.waiting_custom_colour)
 async def custom_colour(m: Message, state: FSMContext, lang: str):
     sess = await _sess(m.from_user.id)
     if m.photo:
         f = await m.bot.get_file(m.photo[-1].file_id)
         buf = await m.bot.download_file(f.file_path)
+        from PIL import Image
         img = Image.open(buf)
-        colour = average_colour(img)
+        colour = bgsvc.average_colour(img)
     else:
         colour = (m.text or "").strip()
-        if not valid_hex(colour):
+        if not bgsvc.valid_hex(colour):
             return await m.answer(t(lang, "bg_bad_hex"))
         if not colour.startswith("#"):
             colour = "#" + colour
@@ -1694,11 +1786,11 @@ async def custom_colour(m: Message, state: FSMContext, lang: str):
             colour = "#" + "".join(c * 2 for c in colour[1:])
     await state.clear()
     sess["bg"], sess["transparent"] = colour.upper(), False
-    await save_session(m.from_user.id, sess)
+    await storage.save_session(m.from_user.id, sess)
     await send_card(m, m.from_user.id, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a.in_({"mask", "edge"})))
+@router.callback_query(Cb.filter(F.a.in_({"mask", "edge"})))
 async def edge_tools(cb: CallbackQuery, lang: str):
     data = Cb.unpack(cb.data)
     sess = await _sess(cb.from_user.id)
@@ -1716,29 +1808,30 @@ async def edge_tools(cb: CallbackQuery, lang: str):
         elif data.v == "s-":
             edge["shift"] = max(-10, edge["shift"] - 1)
     # re-refine mask from the raw cutout
-    await run_cpu(_re_refine, sess)
+    await queue.run_cpu(_re_refine, sess)
     await _save_refresh(cb, sess, lang)
 
 
 def _re_refine(sess: dict):
+    from PIL import Image
     cutout = Image.open(sess["cutout"])
     mask = cutout.getchannel("A") if cutout.mode == "RGBA" else Image.new("L", cutout.size, 255)
     e = sess["edge"]
-    refine_mask(mask, e["feather"], e["shift"]).save(sess["mask"])
+    b.refine_mask(mask, e["feather"], e["shift"]).save(sess["mask"])
 
 
-@menu_router.callback_query(Cb.filter(F.a == "enh"))
+@router.callback_query(Cb.filter(F.a == "enh"))
 async def enh_step(cb: CallbackQuery, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
     await cb.answer()
     r = sess["recipe"]
     if v == "auto":
-        r.update(await run_cpu(_auto, sess))
+        r.update(await queue.run_cpu(_auto, sess))
     elif v == "boost":
-        await run_cpu(_boost, sess)
+        await queue.run_cpu(_boost, sess)
     elif v == "reset":
-        r.update(DEFAULT_RECIPE)
+        r.update(storage.DEFAULT_RECIPE)
     else:
         key, sign = v[:-1], v[-1]
         cur = r.get(key, 0)
@@ -1748,19 +1841,21 @@ async def enh_step(cb: CallbackQuery, lang: str):
 
 
 def _auto(sess):
-    return auto_recipe(Image.open(sess["aligned"]).convert("RGB"))
+    from PIL import Image
+    return ensvc.auto_recipe(Image.open(sess["aligned"]).convert("RGB"))
 
 
 def _boost(sess):
-    boosted = quality_boost(Image.open(sess["aligned"]).convert("RGB"))
+    from PIL import Image
+    boosted = ensvc.quality_boost(Image.open(sess["aligned"]).convert("RGB"))
     boosted.save(sess["aligned"])
     cut = Image.open(sess["cutout"]).convert("RGBA")
-    cut2 = quality_boost(cut.convert("RGB"))
+    cut2 = ensvc.quality_boost(cut.convert("RGB"))
     cut2.putalpha(cut.getchannel("A").resize(cut2.size))
     cut2.save(sess["cutout"])
 
 
-@menu_router.callback_query(Cb.filter(F.a == "look"))
+@router.callback_query(Cb.filter(F.a == "look"))
 async def look_pick(cb: CallbackQuery, lang: str):
     sess = await _sess(cb.from_user.id)
     sess["recipe"]["look"] = Cb.unpack(cb.data).v
@@ -1769,7 +1864,7 @@ async def look_pick(cb: CallbackQuery, lang: str):
     await _save_refresh(cb, sess, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "hist"))
+@router.callback_query(Cb.filter(F.a == "hist"))
 async def undo_redo(cb: CallbackQuery, lang: str):
     sess = await _sess(cb.from_user.id)
     v = Cb.unpack(cb.data).v
@@ -1788,7 +1883,7 @@ async def undo_redo(cb: CallbackQuery, lang: str):
 MOVE = {"normal": 1, "fine": 0.3, "coarse": 3}
 
 
-@menu_router.callback_query(Cb.filter(F.a.in_({"mv", "rot"})))
+@router.callback_query(Cb.filter(F.a.in_({"mv", "rot"})))
 async def crop_move(cb: CallbackQuery, lang: str):
     data = Cb.unpack(cb.data)
     sess = await _sess(cb.from_user.id)
@@ -1817,22 +1912,22 @@ async def crop_move(cb: CallbackQuery, lang: str):
         order = ["fine", "normal", "coarse"]
         c["step"] = order[(order.index(c.get("step", "normal")) + 1) % 3]
     elif data.v == "reset":
-        c.update(DEFAULT_CROP)
+        c.update(storage.DEFAULT_CROP)
     _push_history(sess)
     await _save_refresh(cb, sess, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "cmp"))
+@router.callback_query(Cb.filter(F.a == "cmp"))
 async def compare(cb: CallbackQuery, lang: str):
     sess = await _sess(cb.from_user.id)
     await cb.answer()
-    img = await run_cpu(compare_image, sess)
+    img = await queue.run_cpu(pipeline.compare_image, sess)
     buf = io.BytesIO(); img.save(buf, "JPEG", quality=88)
     await cb.message.answer_photo(BufferedInputFile(buf.getvalue(), "compare.jpg"),
                                   caption=t(lang, "compare_caption"))
 
 
-@menu_router.callback_query(Cb.filter(F.a == "guides"))
+@router.callback_query(Cb.filter(F.a == "guides"))
 async def guides(cb: CallbackQuery, lang: str):
     sess = await _sess(cb.from_user.id)
     sess["crop"]["guides"] = not sess["crop"].get("guides", False)
@@ -1845,19 +1940,20 @@ async def guides(cb: CallbackQuery, lang: str):
 async def sheet_preview(cb_or_msg, sess: dict, lang: str):
     tf = tf_of(lang)
     uid = cb_or_msg.from_user.id
-    final = await run_cpu(render_final, sess)
-    preview_sheet, placed = await run_cpu(
-        lambda: render_sheet(final, sess, preview=True))
+    final = await queue.run_cpu(pipeline.render_final, sess)
+    preview_sheet, placed = await queue.run_cpu(
+        lambda: layout.render_sheet(final, sess, preview=True))
     buf = io.BytesIO(); preview_sheet.save(buf, "PNG")
     fits = placed >= sess["copies"]
     kb = sheet_menu(tf, sess, fits)
     bot = cb_or_msg.bot if hasattr(cb_or_msg, "bot") else cb_or_msg.message.bot
     sheet_id = sess.get("sheet_msg")
     photo = BufferedInputFile(buf.getvalue(), "sheet.png")
+    from aiogram.types import InputMediaPhoto
     caption = tf("sheet_title") if fits else tf(
         "copies_overflow", n=sess["copies"], paper=sess["paper"].upper(),
-        max=max_fit(paper_mm(sess), size_mm(sess),
-                    sess["margin"], sess["gap"]))
+        max=layout.max_fit(layout.paper_mm(sess), layout.size_mm(sess),
+                           sess["margin"], sess["gap"]))
     if sheet_id:
         try:
             await bot.edit_message_media(
@@ -1869,10 +1965,10 @@ async def sheet_preview(cb_or_msg, sess: dict, lang: str):
     sent = await bot.send_photo(uid, photo, caption=caption,
                                 parse_mode="HTML", reply_markup=kb)
     sess["sheet_msg"] = sent.message_id
-    await save_session(uid, sess)
+    await storage.save_session(uid, sess)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "paper"))
+@router.callback_query(Cb.filter(F.a == "paper"))
 async def paper(cb: CallbackQuery, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
@@ -1880,27 +1976,28 @@ async def paper(cb: CallbackQuery, lang: str):
     if v == "open":
         return await cb.message.edit_reply_markup(reply_markup=paper_menu(tf_of(lang)))
     sess["paper"] = v
-    await save_session(cb.from_user.id, sess)
+    await storage.save_session(cb.from_user.id, sess)
     await sheet_preview(cb, sess, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "cp"))
+@router.callback_query(Cb.filter(F.a == "cp"))
 async def copies(cb: CallbackQuery, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
     await cb.answer()
     if v == "max":
-        sess["copies"] = max_fit(paper_mm(sess), size_mm(sess),
-                                 sess["margin"], sess["gap"])
+        sess["copies"] = layout.max_fit(layout.paper_mm(sess),
+                                        layout.size_mm(sess),
+                                        sess["margin"], sess["gap"])
     elif v.startswith(("+", "-")):
         sess["copies"] = max(1, min(60, sess["copies"] + int(v)))
     else:
         sess["copies"] = max(1, min(60, int(v)))
-    await save_session(cb.from_user.id, sess)
+    await storage.save_session(cb.from_user.id, sess)
     await sheet_preview(cb, sess, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "lay"))
+@router.callback_query(Cb.filter(F.a == "lay"))
 async def lay_toggle(cb: CallbackQuery, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
@@ -1913,13 +2010,13 @@ async def lay_toggle(cb: CallbackQuery, lang: str):
         sess["cut_marks"] = not sess["cut_marks"]
     elif v == "border":
         sess["border"] = not sess["border"]
-    await save_session(cb.from_user.id, sess)
+    await storage.save_session(cb.from_user.id, sess)
     await sheet_preview(cb, sess, lang)
 
 
 # ---------- export ----------
 
-@menu_router.callback_query(Cb.filter(F.a == "dl"))
+@router.callback_query(Cb.filter(F.a == "dl"))
 async def download(cb: CallbackQuery, lang: str):
     v = Cb.unpack(cb.data).v
     sess = await _sess(cb.from_user.id)
@@ -1927,26 +2024,26 @@ async def download(cb: CallbackQuery, lang: str):
     await cb.answer(t(lang, "stage_finish"))
     dpi = sess.get("dpi") or 300
     cache_key = f"{uid}:{v}:{sess['size']}:{sess['bg']}:{dpi}:{sess['copies']}:{sess['hpos']}"
-    cached = await cache_get(cache_key)
+    cached = await storage.cache_get(cache_key)
     try:
         if v == "pdf":
             if cached:
                 await cb.message.answer_document(cached)
             else:
-                final = await run_cpu(render_final, sess)
-                pdf = await run_cpu(sheet_pdf, final, sess)
+                final = await queue.run_cpu(pipeline.render_final, sess)
+                pdf = await queue.run_cpu(pdf_export.sheet_pdf, final, sess)
                 doc = BufferedInputFile(pdf, "passport_sheet.pdf")
                 sent = await cb.message.answer_document(doc)
-                await cache_put(cache_key, sent.document.file_id)
+                await storage.cache_put(cache_key, sent.document.file_id)
         elif v in ("png", "jpg", "sheet"):
-            final = await run_cpu(render_final, sess)
-            sheet, _ = await run_cpu(render_sheet, final, sess, dpi)
+            final = await queue.run_cpu(pipeline.render_final, sess)
+            sheet, _ = await queue.run_cpu(layout.render_sheet, final, sess, dpi)
             buf = io.BytesIO()
             sheet.save(buf, "PNG" if v != "jpg" else "JPEG", quality=95)
             name = f"passport_sheet.{ 'jpg' if v == 'jpg' else 'png'}"
             await cb.message.answer_document(BufferedInputFile(buf.getvalue(), name))
         elif v == "single":
-            final = await run_cpu(render_final, sess)
+            final = await queue.run_cpu(pipeline.render_final, sess)
             buf = io.BytesIO()
             if sess.get("transparent"):
                 final_rgba = final.convert("RGBA")
@@ -1961,13 +2058,13 @@ async def download(cb: CallbackQuery, lang: str):
         await cb.message.answer(t(lang, "error_generic"))
 
 
-@menu_router.callback_query(Cb.filter(F.a == "tkb"))
-async def target_kb_cb(cb: CallbackQuery, lang: str):
+@router.callback_query(Cb.filter(F.a == "tkb"))
+async def target_kb(cb: CallbackQuery, lang: str):
     target = int(Cb.unpack(cb.data).v)
     sess = await _sess(cb.from_user.id)
     await cb.answer()
-    final = await run_cpu(render_final, sess)
-    data, kb = await run_cpu(to_jpeg_target_kb, final, target)
+    final = await queue.run_cpu(pipeline.render_final, sess)
+    data, kb = await queue.run_cpu(pdf_export.to_jpeg_target_kb, final, target)
     await cb.message.answer_document(
         BufferedInputFile(data, f"photo_{kb}kb.jpg"),
         caption=t(lang, "target_kb_done", kb=kb))
@@ -1975,31 +2072,31 @@ async def target_kb_cb(cb: CallbackQuery, lang: str):
 
 # ---------- settings callbacks ----------
 
-@menu_router.callback_query(Cb.filter(F.a == "dpi"))
+@router.callback_query(Cb.filter(F.a == "dpi"))
 async def dpi_toggle(cb: CallbackQuery, lang: str):
     uid = cb.from_user.id
-    new = 600 if await get_dpi(uid) == 300 else 300
-    await set_dpi(uid, new)
+    new = 600 if await storage.get_dpi(uid) == 300 else 300
+    await storage.set_dpi(uid, new)
     sess = await _sess(uid)
     sess["dpi"] = new
-    await save_session(uid, sess)
+    await storage.save_session(uid, sess)
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=settings_menu(tf_of(lang), new))
 
 
-@menu_router.callback_query(Cb.filter(F.a == "preset"))
+@router.callback_query(Cb.filter(F.a == "preset"))
 async def preset(cb: CallbackQuery, lang: str):
     v = Cb.unpack(cb.data).v
     uid = cb.from_user.id
     sess = await _sess(uid)
     if v == "save":
-        await save_preset(uid, {
+        await storage.save_preset(uid, {
             "size": sess["size"], "custom_mm": sess["custom_mm"],
             "bg": sess["bg"], "transparent": sess["transparent"],
             "recipe": sess["recipe"]})
         await cb.answer(t(lang, "preset_saved"))
     else:
-        p = await get_preset(uid)
+        p = await storage.get_preset(uid)
         if not p:
             return await cb.answer(t(lang, "no_preset"), show_alert=True)
         sess.update(p)
@@ -2007,163 +2104,164 @@ async def preset(cb: CallbackQuery, lang: str):
         await _save_refresh(cb, sess, lang)
 
 
-@menu_router.callback_query(Cb.filter(F.a == "deldata"))
+@router.callback_query(Cb.filter(F.a == "deldata"))
 async def deldata(cb: CallbackQuery, state: FSMContext, lang: str):
     if Cb.unpack(cb.data).v == "ask":
         await cb.answer(t(lang, "delete_data_confirm"), show_alert=True)
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
         b = InlineKeyboardBuilder()
         b.row(btn(t(lang, "set_delete_data"), "deldata", "yes"))
         return await cb.message.edit_reply_markup(reply_markup=b.as_markup())
     uid = cb.from_user.id
     await state.clear()
-    d = TEMP_DIR / str(uid)
+    d = config.TEMP_DIR / str(uid)
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
-    await clear_session(uid)
-    await delete_user_data(uid)
+    await storage.clear_session(uid)
+    await storage.delete_user_data(uid)
     await cb.answer()
     await cb.message.answer(t(lang, "data_deleted"))
 
 
-@menu_router.callback_query(Cb.filter(F.a == "retry"))
+@router.callback_query(Cb.filter(F.a == "retry"))
 async def retry(cb: CallbackQuery, lang: str):
     await cb.answer()
     await send_card(cb, cb.from_user.id, lang)
 
 
-# ---------- shortcuts as commands ----------
+# shortcuts as commands
 
-@menu_router.message(Command("size"))
+
+@router.message(Command("size"))
 async def c_size(m: Message, lang: str):
     sess = await _sess(m.from_user.id)
     await m.answer(t(lang, "size_title"),
                    reply_markup=size_menu(tf_of(lang), sess["size"]))
 
 
-@menu_router.message(Command("background"))
+@router.message(Command("background"))
 async def c_bg(m: Message, lang: str):
     sess = await _sess(m.from_user.id)
     await m.answer(t(lang, "bg_title"),
                    reply_markup=bg_menu(tf_of(lang), sess.get("bg", "#FFFFFF")))
 
 
-@menu_router.message(Command("copies"))
+@router.message(Command("copies"))
 async def c_copies(m: Message, state: FSMContext, lang: str):
     await state.set_state(Flow.waiting_copies)
     await m.answer(t(lang, "sheet_type_number"))
 
 
-@menu_router.message(Flow.waiting_copies)
+@router.message(Flow.waiting_copies)
 async def c_copies_num(m: Message, state: FSMContext, lang: str):
     if not (m.text or "").isdigit():
         return await m.answer(t(lang, "sheet_type_number"))
     await state.clear()
     sess = await _sess(m.from_user.id)
     sess["copies"] = max(1, min(60, int(m.text)))
-    await save_session(m.from_user.id, sess)
+    await storage.save_session(m.from_user.id, sess)
     await sheet_preview(m, sess, lang)
 
 
-@menu_router.message(Command("paper"))
+@router.message(Command("paper"))
 async def c_paper(m: Message, lang: str):
     await m.answer(t(lang, "sheet_paper", paper=""), reply_markup=paper_menu(tf_of(lang)))
 
+# ============================== Single shared router ==============================
 
-# ========================================================================
-# ENTRY POINT: polling for dev, aiohttp webhook for production
-# ========================================================================
+# ============================== Startup and lifecycle ==============================
 def setup_logging() -> None:
-    ensure_dirs()
+    config.ensure_dirs()
     root = logging.getLogger()
-    root.setLevel(LOG_LEVEL)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt)
-    fh = RotatingFileHandler(DATA_DIR / "bot.log", maxBytes=2_000_000,
-                             backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt)
-    root.addHandler(sh); root.addHandler(fh)
-
+    root.setLevel(config.LOG_LEVEL)
+    if not root.handlers:
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        fh = RotatingFileHandler(config.DATA_DIR / "bot.log", maxBytes=2_000_000,
+                                 backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(sh)
+        root.addHandler(fh)
 
 async def set_commands(bot: Bot) -> None:
-    en = [BotCommand(command=c, description=d) for c, d in [
+    commands = [
         ("start", "Start"), ("help", "How it works"), ("settings", "Settings"),
         ("size", "Photo size"), ("background", "Background colour"),
         ("copies", "Copies on sheet"), ("paper", "Paper size"),
         ("language", "Language"), ("reset", "Reset edits"),
-        ("cancel", "Clear session"), ("privacy", "Privacy")]]
-    hi = [BotCommand(command=c.command, description=d) for c, d in zip(en, [
-        "शुरू करें", "मदद", "सेटिंग्स", "फोटो साइज़", "बैकग्राउंड रंग",
-        "शीट पर कॉपी", "पेपर साइज़", "भाषा", "रीसेट", "सत्र साफ़ करें", "निजता"])]
+        ("cancel", "Clear session"), ("privacy", "Privacy"),
+    ]
+    en = [BotCommand(command=c, description=d) for c, d in commands]
+    hi_desc = ["शुरू करें", "मदद", "सेटिंग्स", "फोटो साइज़", "बैकग्राउंड रंग",
+               "शीट पर कॉपी", "पेपर साइज़", "भाषा", "रीसेट", "सत्र साफ़ करें", "निजता"]
+    hi = [BotCommand(command=c, description=d) for (c, _), d in zip(commands, hi_desc)]
     await bot.set_my_commands(en)
     await bot.set_my_commands(hi, language_code="hi")
 
-
 async def cleanup_loop() -> None:
-    """Delete temp files older than the TTL, every 5 minutes."""
-    ttl = TEMP_TTL_MINUTES * 60
+    ttl = config.TEMP_TTL_MINUTES * 60
     while True:
         await asyncio.sleep(300)
         now = time.time()
-        if not TEMP_DIR.exists():
+        if not config.TEMP_DIR.exists():
             continue
-        for d in TEMP_DIR.iterdir():
+        for directory in config.TEMP_DIR.iterdir():
             try:
-                if d.is_dir() and now - max((f.stat().st_mtime for f in d.glob("*")),
-                                            default=d.stat().st_mtime) > ttl:
-                    shutil.rmtree(d, ignore_errors=True)
-            except Exception:
-                pass
-
+                if directory.is_dir():
+                    latest = max((f.stat().st_mtime for f in directory.glob("**/*")
+                                  if f.is_file()), default=directory.stat().st_mtime)
+                    if now - latest > ttl:
+                        shutil.rmtree(directory, ignore_errors=True)
+            except OSError:
+                logging.getLogger("bot").debug("Could not clean %s", directory, exc_info=True)
 
 async def on_startup(bot: Bot) -> None:
-    ensure_dirs()
-    await db_init()
+    config.ensure_dirs()
+    await storage.init()
     load_locales()
     await set_commands(bot)
-    asyncio.create_task(cleanup_loop())
-
+    asyncio.create_task(cleanup_loop(), name="temp-cleanup")
 
 async def on_shutdown(bot: Bot) -> None:
-    queue_shutdown()
-    await db_close()
-
+    queue.shutdown()
+    await storage.close()
 
 def build() -> tuple[Bot, Dispatcher]:
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is not set. Copy .env.example to .env and fill it in.")
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    if not config.BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is not set. Configure it as a Railway environment variable.")
+    bot = Bot(config.BOT_TOKEN,
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(ErrorMiddleware())
     dp.message.middleware(FloodMiddleware())
     dp.callback_query.middleware(FloodMiddleware())
     dp.message.middleware(UserMiddleware())
     dp.callback_query.middleware(UserMiddleware())
-    dp.include_router(core_router)
-    dp.include_router(photo_router)
-    dp.include_router(menu_router)
+    dp.include_router(router)
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
     return bot, dp
 
-
 def main() -> None:
     setup_logging()
     bot, dp = build()
-    if MODE == "webhook":
-        from aiogram.webhook.aiohttp_server import (SimpleRequestHandler,
-                                                    setup_application)
+    if config.MODE == "webhook":
+        if not config.WEBHOOK_URL:
+            raise SystemExit("WEBHOOK_URL is required when MODE=webhook")
         from aiohttp import web
+        from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
         app = web.Application()
         SimpleRequestHandler(dp, bot).register(app, path="/webhook")
         setup_application(app, dp, bot=bot)
 
-        async def _hook(app):
-            await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-        app.on_startup.append(_hook)
-        web.run_app(app, host=WEBHOOK_HOST, port=WEBHOOK_PORT)
+        async def register_webhook(_app):
+            await bot.set_webhook(config.WEBHOOK_URL, drop_pending_updates=True)
+
+        app.on_startup.append(register_webhook)
+        web.run_app(app, host=config.WEBHOOK_HOST, port=config.WEBHOOK_PORT)
     else:
         asyncio.run(dp.start_polling(bot, drop_pending_updates=True))
-
 
 if __name__ == "__main__":
     main()
