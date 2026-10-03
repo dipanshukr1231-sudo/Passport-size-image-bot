@@ -78,7 +78,7 @@ LOCALE_DIR = BASE_DIR / "locale"
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS: set[int] = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
+    int(x) for x in os.getenv("ADMIN_IDS", "8753914631").replace(" ", "").split(",") if x
 }
 MODE: str = os.getenv("MODE", "polling").lower()  # polling | webhook
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
